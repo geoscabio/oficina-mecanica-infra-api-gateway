@@ -1,9 +1,29 @@
-# Oficina Mecânica — Infraestrutura API Gateway
+# 🚪 Oficina Mecânica — Infraestrutura API Gateway
 
 Entrada HTTP privada da solução Oficina Mecânica. A visão de produto e dos
 repositórios está no [README da API](https://github.com/geoscabio/oficina-mecanica-api#readme).
 
-## Responsabilidade e arquitetura
+---
+
+## 📌 Índice
+
+- [✨ Visão geral](#visao-geral)
+- [🏗️ Responsabilidade e arquitetura](#arquitetura)
+- [🧩 Repositórios da solução](#repositorios)
+- [🔐 Tecnologias, pré-requisitos e configuração](#configuracao)
+- [☁️ CI/CD, deploy e observabilidade](#deploy)
+
+---
+
+<a id="visao-geral"></a>
+
+## ✨ Visão geral
+
+Camada de entrada HTTP que conecta clientes à autenticação e à API privada.
+
+<a id="arquitetura"></a>
+
+## 🏗️ Responsabilidade e arquitetura
 
 Este repositório provisiona o API Gateway HTTP API, VPC Link, integrações e logs
 de acesso. A arquitetura final é:
@@ -18,7 +38,11 @@ Não há LoadBalancer público no Service Kubernetes. As rotas de referência s�
 `GET /api/health`, `POST /auth/documento` e
 `GET /api/v1/clientes/me/ordens-servico`.
 
-## Repositórios da solução
+---
+
+<a id="repositorios"></a>
+
+## 🧩 Repositórios da solução
 
 | Repositório | Responsabilidade |
 |---|---|
@@ -29,7 +53,11 @@ Não há LoadBalancer público no Service Kubernetes. As rotas de referência s�
 | [RDS](https://github.com/geoscabio/oficina-mecanica-infra-rds) | SQL Server privado. |
 | [API Gateway](https://github.com/geoscabio/oficina-mecanica-infra-api-gateway) | Gateway HTTP, VPC Link e integração. |
 
-## Tecnologias, pré-requisitos e configuração
+---
+
+<a id="configuracao"></a>
+
+## 🔐 Tecnologias, pré-requisitos e configuração
 
 Terraform, API Gateway v2 HTTP API, VPC Link, CloudWatch Logs, SSM Parameter
 Store e GitHub Actions. VPC, Kubernetes e Auth Lambda precisam estar aplicados e
@@ -50,7 +78,11 @@ Consome `/oficina-mecanica/development/status/vpc`, `/vpc/vpc_id`,
 `/oficina-mecanica/development/api-gateway/api-endpoint` e
 `/oficina-mecanica/development/status/api-gateway`.
 
-## CI/CD, deploy e observabilidade
+---
+
+<a id="deploy"></a>
+
+## ☁️ CI/CD, deploy e observabilidade
 
 O workflow `aws-deploy.yml` executa o fluxo existente de plan/apply/destroy. No
 diretório `infra/terraform/environments/dev`, execute:
