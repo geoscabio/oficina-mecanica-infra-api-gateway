@@ -1,0 +1,251 @@
+name: "☁️ AWS Deploy"
+run-name: "☁️ Executar deploy AWS do API Gateway em ${{ inputs.environment_name }}"
+
+on:
+  workflow_call:
+    inputs:
+      environment_name:
+        description: "GitHub Environment used by this deploy."
+        required: true
+        type: string
+    outputs:
+      terraform_action:
+        description: "Resolved Terraform action: apply or destroy."
+        value: ${{ jobs.resolve_action.outputs.terraform_action }}
+
+env:
+  TF_WORKING_DIRECTORY: infra/terraform/environments/dev
+  TERRAFORM_VERSION: "1.15.8"
+  SSM_VPC_PREFIX: /oficina-mecanica/development/vpc
+  SSM_VPC_STATUS_PARAMETER: /oficina-mecanica/development/status/vpc
+  SSM_KUBERNETES_PREFIX: /oficina-mecanica/development/kubernetes
+  SSM_KUBERNETES_STATUS_PARAMETER: /oficina-mecanica/development/status/kubernetes
+  SSM_AUTH_LAMBDA_PREFIX: /oficina-mecanica/development/auth-lambda
+  SSM_AUTH_LAMBDA_STATUS_PARAMETER: /oficina-mecanica/development/status/auth-lambda
+  SSM_API_GATEWAY_PREFIX: /oficina-mecanica/development/api-gateway
+  SSM_API_GATEWAY_STATUS_PARAMETER: /oficina-mecanica/development/status/api-gateway
+
+jobs:
+  resolve_action:
+    name: "🔎 01 · Resolver ação do Terraform"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment_name }}
+    outputs:
+      terraform_action: ${{ steps.resolve.outputs.terraform_action }}
+    steps:
+      - name: "📥 01 · Baixar código do repositório"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: "🚦 02 · Ler terraform-action.env e validar destroy"
+        id: resolve
+        env:
+          GITHUB_BEFORE: ${{ github.event.before }}
+          GITHUB_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          control_file="$TF_WORKING_DIRECTORY/terraform-action.env"
+          test -f "$control_file" || { echo "::error::terraform-action.env ausente."; exit 1; }
+          action="$(grep -E '^[[:space:]]*TERRAFORM_ACTION[[:space:]]*=' "$control_file" | tail -1 | cut -d '=' -f2- | tr -d '\r' | xargs)"
+          case "$action" in
+            apply|destroy) ;;
+            *) echo "::error::TERRAFORM_ACTION inválida: $action"; exit 1 ;;
+          esac
+          if [ "$action" = "destroy" ]; then
+            if [ -z "$GITHUB_BEFORE" ] || [ "$GITHUB_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              echo "::warning::Destroy em push inicial; não há SHA anterior."
+            elif ! git cat-file -e "$GITHUB_BEFORE^{commit}" 2>/dev/null; then
+              echo "::error::SHA anterior inválido; destroy bloqueado."
+              exit 1
+            elif ! git diff --name-only "$GITHUB_BEFORE" "$GITHUB_AFTER" -- "$control_file" | grep -qx "$control_file"; then
+              echo "::warning::Destroy exige alteração do terraform-action.env no próprio push."
+              exit 1
+            fi
+          fi
+          echo "terraform_action=$action" >> "$GITHUB_OUTPUT"
+
+  prepare_and_plan:
+    name: "📋 02 · Preparar e gerar plano do Terraform"
+    needs:
+      - resolve_action
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment_name }}
+    outputs:
+      api_gateway_id_before_destroy: ${{ steps.destroy_context.outputs.api_gateway_id_before_destroy }}
+      vpc_link_id_before_destroy: ${{ steps.destroy_context.outputs.vpc_link_id_before_destroy }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TERRAFORM_ACTION: ${{ needs.resolve_action.outputs.terraform_action }}
+    steps:
+      - name: "📥 01 · Baixar código do repositório"
+        uses: actions/checkout@v7
+      - name: "🔑 02 · Configurar credenciais AWS"
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: "🛠️ 03 · Instalar Terraform"
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - name: "🚦 04 · Validar dependências reais"
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: |
+          set -euo pipefail
+          get_parameter() { aws ssm get-parameter --name "$1" --query 'Parameter.Value' --output text; }
+          require_parameter() { test -n "$2" && [ "$2" != "None" ] || { echo "::error::Contrato SSM inválido: $1"; exit 1; }; }
+          test "$(get_parameter "$SSM_VPC_STATUS_PARAMETER")" = ready || exit 1
+          test "$(get_parameter "$SSM_KUBERNETES_STATUS_PARAMETER")" = ready || exit 1
+          test "$(get_parameter "$SSM_AUTH_LAMBDA_STATUS_PARAMETER")" = ready || exit 1
+          vpc_id="$(get_parameter "$SSM_VPC_PREFIX/vpc_id")"; private_subnet_ids="$(get_parameter "$SSM_VPC_PREFIX/private_subnet_ids")"; nlb_sg="$(get_parameter "$SSM_KUBERNETES_PREFIX/internal_nlb_security_group_id")"; listener_arn="$(get_parameter "$SSM_KUBERNETES_PREFIX/internal_nlb_listener_arn")"; function_arn="$(get_parameter "$SSM_AUTH_LAMBDA_PREFIX/function_arn")"; function_name="$(get_parameter "$SSM_AUTH_LAMBDA_PREFIX/function_name")"
+          require_parameter vpc_id "$vpc_id"; require_parameter private_subnet_ids "$private_subnet_ids"; require_parameter internal_nlb_security_group_id "$nlb_sg"; require_parameter internal_nlb_listener_arn "$listener_arn"; require_parameter function_arn "$function_arn"; require_parameter function_name "$function_name"
+          test "$(aws ec2 describe-vpcs --vpc-ids "$vpc_id" --query 'Vpcs[0].State' --output text)" = available
+          for subnet in ${private_subnet_ids//,/ }; do test "$(aws ec2 describe-subnets --subnet-ids "$subnet" --query 'Subnets[0].State' --output text)" = available; test "$(aws ec2 describe-subnets --subnet-ids "$subnet" --query 'Subnets[0].VpcId' --output text)" = "$vpc_id"; done
+          test "$(aws ec2 describe-security-groups --group-ids "$nlb_sg" --query 'SecurityGroups[0].VpcId' --output text)" = "$vpc_id"
+          lb="$(aws elbv2 describe-listeners --listener-arns "$listener_arn" --query 'Listeners[0].LoadBalancerArn' --output text)"; test "$(aws elbv2 describe-load-balancers --load-balancer-arns "$lb" --query 'LoadBalancers[0].Scheme' --output text)" = internal; test "$(aws elbv2 describe-load-balancers --load-balancer-arns "$lb" --query 'LoadBalancers[0].State.Code' --output text)" = active
+          tg="$(aws elbv2 describe-listeners --listener-arns "$listener_arn" --query 'Listeners[0].DefaultActions[0].TargetGroupArn' --output text)"; test "$(aws elbv2 describe-target-health --target-group-arn "$tg" --query 'length(TargetHealthDescriptions[?TargetHealth.State==`healthy`])' --output text)" -gt 0
+          test "$(aws lambda get-function-configuration --function-name "$function_name" --query State --output text)" = Active; test "$(aws lambda get-function --function-name "$function_name" --query 'Configuration.FunctionArn' --output text)" = "$function_arn"
+      - name: "📦 05 · Restaurar cache do state Terraform"
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate
+            ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup
+          key: tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tfstate-api-gateway-${{ inputs.environment_name }}-
+      - name: "🚀 06 · Inicializar Terraform"
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" init -input=false
+      - name: "🔍 07 · Validar configuração Terraform"
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" validate
+      - name: "🛡️ 08 · Capturar contexto pré-destroy"
+        id: destroy_context
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: |
+          set -euo pipefail
+          api_id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_id 2>/dev/null || true)"
+          vpc_link_id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw vpc_link_id 2>/dev/null || true)"
+          [ -n "$api_id" ] || api_id="$(aws apigatewayv2 get-apis --query 'Items[?Name==`oficina-mecanica-api-gateway-dev`].ApiId | [0]' --output text)"
+          [ -n "$vpc_link_id" ] || vpc_link_id="$(aws apigatewayv2 get-vpc-links --query 'Items[?Name==`oficina-mecanica-api-gateway-vpc-link-dev`].VpcLinkId | [0]' --output text)"
+          [ "$api_id" != None ] || api_id=""
+          [ "$vpc_link_id" != None ] || vpc_link_id=""
+          echo "api_gateway_id_before_destroy=$api_id" >> "$GITHUB_OUTPUT"
+          echo "vpc_link_id_before_destroy=$vpc_link_id" >> "$GITHUB_OUTPUT"
+      - name: "📐 09 · Gerar plano do Terraform (apply)"
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" plan -input=false -out=tfplan
+      - name: "📐 10 · Gerar plano do Terraform (destroy)"
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" plan -destroy -input=false -out=tfplan
+      - name: "⬆️ 11 · Publicar plano do Terraform"
+        uses: actions/upload-artifact@v7
+        with:
+          name: tfplan-api-gateway-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIRECTORY }}/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  apply_or_destroy:
+    name: "☁️ 03 · Aplicar ou destruir API Gateway"
+    needs:
+      - resolve_action
+      - prepare_and_plan
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment_name }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      TERRAFORM_ACTION: ${{ needs.resolve_action.outputs.terraform_action }}
+      API_GATEWAY_ID_BEFORE_DESTROY: ${{ needs.prepare_and_plan.outputs.api_gateway_id_before_destroy }}
+      VPC_LINK_ID_BEFORE_DESTROY: ${{ needs.prepare_and_plan.outputs.vpc_link_id_before_destroy }}
+    steps:
+      - name: "📥 01 · Baixar código do repositório"
+        uses: actions/checkout@v7
+      - name: "🔑 02 · Configurar credenciais AWS"
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: "🛠️ 03 · Instalar Terraform"
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - name: "📦 04 · Restaurar cache do state Terraform"
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate
+            ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup
+          key: tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            tfstate-api-gateway-${{ inputs.environment_name }}-
+      - name: "⬇️ 05 · Baixar plano do Terraform"
+        uses: actions/download-artifact@v8
+        with:
+          name: tfplan-api-gateway-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIRECTORY }}
+      - name: "🚀 06 · Inicializar Terraform"
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" init -input=false
+      - name: "✅ 07 · Aplicar plano do Terraform"
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" apply -input=false -auto-approve tfplan
+      - name: "💾 08 · Salvar cache final do state Terraform"
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate
+            ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup
+          key: tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: "🔎 09 · Validar API Gateway real após apply"
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: |
+          set -euo pipefail
+          api_gateway_id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_id)"
+          api_gateway_endpoint="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_endpoint)"
+          vpc_link_id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw vpc_link_id)"
+          test "$(aws apigatewayv2 get-api --api-id "$api_gateway_id" --query ProtocolType --output text)" = HTTP
+          test "$(aws apigatewayv2 get-stage --api-id "$api_gateway_id" --stage-name '$default' --query AutoDeploy --output text)" = True
+          for attempt in $(seq 1 60); do
+            status="$(aws apigatewayv2 get-vpc-link --vpc-link-id "$vpc_link_id" --query VpcLinkStatus --output text)"
+            [ "$status" = AVAILABLE ] && break
+            [ "$status" = FAILED ] && { echo "::error::VPC Link falhou."; exit 1; }
+            sleep 10
+          done
+          test "$status" = AVAILABLE || { echo "::error::Timeout aguardando VPC Link AVAILABLE."; exit 1; }
+          mapfile -t routes < <(aws apigatewayv2 get-routes --api-id "$api_gateway_id" --query 'Items[].RouteKey' --output text | tr '\t' '\n' | sort)
+          test "${#routes[@]}" -eq 2
+          printf '%s\n' "${routes[@]}" | grep -Fx 'POST /auth/documento'
+          printf '%s\n' "${routes[@]}" | grep -Fx 'ANY /api/{proxy+}'
+          test "$(aws ssm get-parameter --name "$SSM_API_GATEWAY_PREFIX/api-endpoint" --query Parameter.Value --output text)" = "$api_gateway_endpoint"
+          test "$(aws ssm get-parameter --name "$SSM_API_GATEWAY_STATUS_PARAMETER" --query Parameter.Value --output text)" = ready
+          for attempt in $(seq 1 10); do
+            curl --fail --silent --show-error "$api_gateway_endpoint/api/health" >/dev/null && exit 0
+            sleep 6
+          done
+          echo "::error::Health via API Gateway não retornou 200."
+          exit 1
+      - name: "🔎 10 · Validar remoção real após destroy"
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: |
+          set -euo pipefail
+          assert_absent() {
+            local label="$1"; shift
+            local output
+            if output="$("$@" 2>&1)"; then echo "::error::$label ainda existe."; return 1; fi
+            case "$output" in *NotFoundException*|*ParameterNotFound*) echo "$label ausente.";; *) echo "::error::Falha ao validar $label: $output"; return 1;; esac
+          }
+          if [ -n "$API_GATEWAY_ID_BEFORE_DESTROY" ]; then assert_absent "API Gateway" aws apigatewayv2 get-api --api-id "$API_GATEWAY_ID_BEFORE_DESTROY"; fi
+          if [ -n "$VPC_LINK_ID_BEFORE_DESTROY" ]; then assert_absent "VPC Link" aws apigatewayv2 get-vpc-link --vpc-link-id "$VPC_LINK_ID_BEFORE_DESTROY"; fi
+          test "$(aws apigatewayv2 get-apis --query 'length(Items[?Name==`oficina-mecanica-api-gateway-dev`])' --output text)" = 0
+          test "$(aws apigatewayv2 get-vpc-links --query 'length(Items[?Name==`oficina-mecanica-api-gateway-vpc-link-dev`])' --output text)" = 0
+          assert_absent "SSM api-endpoint" aws ssm get-parameter --name "$SSM_API_GATEWAY_PREFIX/api-endpoint"
+          assert_absent "SSM status" aws ssm get-parameter --name "$SSM_API_GATEWAY_STATUS_PARAMETER"
+          echo "API Gateway, VPC Link e contratos SSM removidos."
