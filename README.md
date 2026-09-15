@@ -12,9 +12,9 @@ Este repositório será responsável por expor a solução por uma HTTP API, enc
 
 ## 📌 Responsabilidades
 
-Pertencem a esta esteira: HTTP API, stage `$default`, rotas, integrações, VPC Link, Security Group do VPC Link, regra VPC Link → NLB, Lambda permission, access logs e contratos SSM próprios.
-
-Não pertencem a esta esteira: VPC/subnets, NLB/Target Group/listener, EKS, Service Kubernetes, Auth Lambda, RDS, secrets/JWT e workload da API.
+| Este repositório possui | Consome | Não pertence a este repositório |
+| --- | --- | --- |
+| HTTP API, stage `$default`, rotas, integrações, VPC Link, SG do VPC Link, regra VPC Link → NLB, Lambda permission, access logs e SSM próprio | Contratos da VPC, Kubernetes/NLB interno e Auth Lambda | VPC/subnets, NLB/Target Group/listener, EKS, Service Kubernetes, Auth Lambda, RDS, secrets/JWT e workload da API |
 
 ---
 
@@ -29,7 +29,13 @@ API Gateway HTTP API
    +-- ANY /api/{proxy+} -> VPC Link -> NLB interno -> EKS/API
 ```
 
-`/api/health` será atendido pela rota proxy `ANY /api/{proxy+}`.
+| Rota | Destino planejado |
+| --- | --- |
+| `POST /auth/documento` | Auth Lambda |
+| `ANY /api/{proxy+}` | VPC Link → NLB interno → EKS/API |
+| `/api/health` | Atendida pela rota proxy |
+
+O backend permanecerá privado; o Gateway será a entrada pública única somente após o cutover F3-012.
 
 ---
 
@@ -49,15 +55,39 @@ API Gateway HTTP API
 
 ## 🔗 Dependências e contratos SSM
 
-Contratos planejados/esperados: VPC (`/oficina-mecanica/development/status/vpc`, `vpc_id`, `private_subnet_ids`), Kubernetes (`status/kubernetes`, `internal_nlb_security_group_id`, `internal_nlb_listener_arn`) e Auth Lambda (`status/auth-lambda`, `function_arn`, `function_name`).
-
-O Gateway publicará, somente após Terraform e deploy: `/oficina-mecanica/development/api-gateway/api-endpoint` e `/oficina-mecanica/development/status/api-gateway`.
+| Contrato | Uso | Papel |
+| --- | --- | --- |
+| `/oficina-mecanica/development/status/vpc` | Estado da VPC | Consumido |
+| `/oficina-mecanica/development/vpc/vpc_id` | VPC do VPC Link | Consumido |
+| `/oficina-mecanica/development/vpc/private_subnet_ids` | Subnets privadas | Consumido |
+| `/oficina-mecanica/development/status/kubernetes` | Estado Kubernetes | Consumido |
+| `/oficina-mecanica/development/kubernetes/internal_nlb_security_group_id` | SG do NLB | Consumido |
+| `/oficina-mecanica/development/kubernetes/internal_nlb_listener_arn` | Listener TCP/80 | Consumido |
+| `/oficina-mecanica/development/status/auth-lambda` | Estado Auth Lambda | Consumido |
+| `/oficina-mecanica/development/auth-lambda/function_arn` | Integração Lambda | Consumido |
+| `/oficina-mecanica/development/auth-lambda/function_name` | Permissão Lambda | Consumido |
+| `/oficina-mecanica/development/api-gateway/api-endpoint` | Endpoint público | Publicado após deploy |
+| `/oficina-mecanica/development/status/api-gateway` | Estado do Gateway | Publicado após deploy |
 
 ---
 
 ## 📁 Estrutura do repositório
 
-Hoje existem `README.md` e `.github/workflows/ci.yml`. A estrutura `infra/terraform/environments/dev` é prevista para a próxima rodada.
+Estado atual:
+
+```text
+.
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+└── README.md
+```
+
+Estrutura planejada, ainda inexistente:
+
+```text
+infra/terraform/environments/dev/
+```
 
 ---
 
@@ -67,13 +97,29 @@ Hoje existem `README.md` e `.github/workflows/ci.yml`. A estrutura `infra/terraf
 branch de trabalho -> develop -> release -> main
 ```
 
-Branches protegidas: `develop`, `release`, `release/*` e `main`. Os rulesets ativos são `Aprovação de PR` e `Proteção Git Flow`; bypass por PR existe apenas no primeiro. Checks obrigatórios: `🔀 01 · Validar fluxo de branches` e `🚦 03 · Quality gate`.
+```text
+branch de trabalho -> PR develop -> PR release -> PR main
+```
+
+Branches protegidas: `develop`, `release`, `release/*` e `main`.
+
+- `Proteção Git Flow`: exige PR, resolução de conversas e checks; bloqueia push direto, force push e deletion; não possui bypass.
+- `Aprovação de PR`: exige revisão e permite bypass somente via PR para atores autorizados.
+
+Checks obrigatórios: `🔀 01 · Validar fluxo de branches` e `🚦 03 · Quality gate`.
 
 ---
 
 ## 🧪 CI
 
-O CI atual possui detecção de escopo, validação Git Flow, validação Terraform condicional e Quality Gate. No bootstrap, a validação pesada pode ser pulada enquanto Terraform não existir; após sua inclusão, `fmt`, `init` e `validate` serão exigidos para mudanças deployáveis.
+| Job | Responsabilidade |
+| --- | --- |
+| `🔎 00 · Detectar escopo do PR` | Identifica mudanças relevantes |
+| `🔀 01 · Validar fluxo de branches` | Confere origem e destino do PR |
+| `🌐 02 · Validar Terraform do API Gateway` | Executará fmt/init/validate quando Terraform existir |
+| `🚦 03 · Quality gate` | Consolida os resultados |
+
+No bootstrap, a validação pesada pode ser pulada; após a inclusão do Terraform, ela será exigida para mudanças deployáveis.
 
 ---
 
@@ -91,10 +137,23 @@ terraform -chdir=infra/terraform/environments/dev validate
 
 ## 🧨 Ordem de operação
 
-```text
-Apply: VPC -> Kubernetes -> RDS -> API/NodePort -> Auth Lambda -> API Gateway
-Destroy: API Gateway -> API workload -> Auth Lambda -> RDS -> Kubernetes -> VPC
-```
+#### Apply
+
+1. VPC
+2. Kubernetes
+3. RDS
+4. API workload / NodePort
+5. Auth Lambda
+6. API Gateway
+
+#### Destroy
+
+1. API Gateway
+2. API workload
+3. Auth Lambda
+4. RDS
+5. Kubernetes
+6. VPC
 
 ---
 
@@ -102,11 +161,26 @@ Destroy: API Gateway -> API workload -> Auth Lambda -> RDS -> Kubernetes -> VPC
 
 | Item | Estado |
 | --- | --- |
-| Repositório, Git Flow, rulesets e CI | ✅ |
-| README | Este PR |
-| Terraform, CD Development, AWS Deploy e deploy real | ⏳ |
-| E2E/cutover | ⏳ |
+| Repositório | ✅ |
+| main/develop/release | ✅ |
+| Rulesets | ✅ |
+| CI | ✅ |
+| README | 🚧 |
+| Terraform | ⏳ |
+| CD Development | ⏳ |
+| AWS Deploy | ⏳ |
+| Deploy real | ⏳ |
+| E2E F3-012 | ⏳ |
+| Cutover | ⏳ |
 
 ## 🗺️ Próximos passos
 
-Terraform base, auditoria e merge, CD Development/AWS Deploy, `terraform-action.env`, Environment/secrets/variables, deploy real, validações E2E F3-012 e, somente depois, remoção da exposição pública legada.
+1. Terraform base
+2. Auditoria
+3. Merge
+4. CD Development / AWS Deploy
+5. `terraform-action.env`
+6. GitHub Environment/secrets/variables
+7. Deploy real
+8. E2E F3-012
+9. Remoção da exposição pública legada somente após aceite
