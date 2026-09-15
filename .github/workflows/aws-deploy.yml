@@ -204,3 +204,48 @@ jobs:
             ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate
             ${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup
           key: tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: "🔎 09 · Validar API Gateway real após apply"
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: |
+          set -euo pipefail
+          api_gateway_id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_id)"
+          api_gateway_endpoint="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_endpoint)"
+          vpc_link_id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw vpc_link_id)"
+          test "$(aws apigatewayv2 get-api --api-id "$api_gateway_id" --query ProtocolType --output text)" = HTTP
+          test "$(aws apigatewayv2 get-stage --api-id "$api_gateway_id" --stage-name '$default' --query AutoDeploy --output text)" = True
+          for attempt in $(seq 1 60); do
+            status="$(aws apigatewayv2 get-vpc-link --vpc-link-id "$vpc_link_id" --query VpcLinkStatus --output text)"
+            [ "$status" = AVAILABLE ] && break
+            [ "$status" = FAILED ] && { echo "::error::VPC Link falhou."; exit 1; }
+            sleep 10
+          done
+          test "$status" = AVAILABLE || { echo "::error::Timeout aguardando VPC Link AVAILABLE."; exit 1; }
+          mapfile -t routes < <(aws apigatewayv2 get-routes --api-id "$api_gateway_id" --query 'Items[].RouteKey' --output text | tr '\t' '\n' | sort)
+          test "${#routes[@]}" -eq 2
+          printf '%s\n' "${routes[@]}" | grep -Fx 'POST /auth/documento'
+          printf '%s\n' "${routes[@]}" | grep -Fx 'ANY /api/{proxy+}'
+          test "$(aws ssm get-parameter --name "$SSM_API_GATEWAY_PREFIX/api-endpoint" --query Parameter.Value --output text)" = "$api_gateway_endpoint"
+          test "$(aws ssm get-parameter --name "$SSM_API_GATEWAY_STATUS_PARAMETER" --query Parameter.Value --output text)" = ready
+          for attempt in $(seq 1 10); do
+            curl --fail --silent --show-error "$api_gateway_endpoint/api/health" >/dev/null && exit 0
+            sleep 6
+          done
+          echo "::error::Health via API Gateway não retornou 200."
+          exit 1
+      - name: "🔎 10 · Validar remoção real após destroy"
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: |
+          set -euo pipefail
+          assert_absent() {
+            local label="$1"; shift
+            local output
+            if output="$("$@" 2>&1)"; then echo "::error::$label ainda existe."; return 1; fi
+            case "$output" in *NotFoundException*|*ParameterNotFound*) echo "$label ausente.";; *) echo "::error::Falha ao validar $label: $output"; return 1;; esac
+          }
+          if [ -n "$API_GATEWAY_ID_BEFORE_DESTROY" ]; then assert_absent "API Gateway" aws apigatewayv2 get-api --api-id "$API_GATEWAY_ID_BEFORE_DESTROY"; fi
+          if [ -n "$VPC_LINK_ID_BEFORE_DESTROY" ]; then assert_absent "VPC Link" aws apigatewayv2 get-vpc-link --vpc-link-id "$VPC_LINK_ID_BEFORE_DESTROY"; fi
+          test "$(aws apigatewayv2 get-apis --query 'length(Items[?Name==`oficina-mecanica-api-gateway-dev`])' --output text)" = 0
+          test "$(aws apigatewayv2 get-vpc-links --query 'length(Items[?Name==`oficina-mecanica-api-gateway-vpc-link-dev`])' --output text)" = 0
+          assert_absent "SSM api-endpoint" aws ssm get-parameter --name "$SSM_API_GATEWAY_PREFIX/api-endpoint"
+          assert_absent "SSM status" aws ssm get-parameter --name "$SSM_API_GATEWAY_STATUS_PARAMETER"
+          echo "API Gateway, VPC Link e contratos SSM removidos."
