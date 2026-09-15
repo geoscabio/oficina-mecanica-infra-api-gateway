@@ -165,7 +165,7 @@ terraform -chdir=infra/terraform/environments/dev validate
 | main/develop/release | ✅ |
 | Rulesets | ✅ |
 | CI | ✅ |
-| README | 🚧 |
+| README | ✅ |
 | Terraform | ⏳ |
 | CD Development | ⏳ |
 | AWS Deploy | ⏳ |
