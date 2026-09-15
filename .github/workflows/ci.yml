@@ -27,30 +27,60 @@ jobs:
     outputs:
       ci_required: ${{ steps.detect.outputs.ci_required }}
     steps:
-      - uses: actions/checkout@v7
+      - name: "📥 01 · Baixar código do repositório"
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - id: detect
+      - name: "🔍 02 · Analisar arquivos alterados"
+        id: detect
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           ci_required=false
-          if [ -d infra/terraform ] && git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -qvE '\.md$'; then ci_required=true; fi
+          changed_files="$(mktemp)"
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_files"
+          if [ ! -s "$changed_files" ]; then
+            echo "No changed files found. Running full CI for safety."
+            ci_required=true
+          else
+            echo "Changed files:"
+            cat "$changed_files"
+            if [ -d infra/terraform ]; then
+              while IFS= read -r file; do
+                case "$file" in
+                  *.md) ;;
+                  *) ci_required=true; break ;;
+                esac
+              done < "$changed_files"
+            else
+              echo "Terraform directory is not present yet; heavy validation is safely deferred during bootstrap."
+            fi
+          fi
           echo "ci_required=$ci_required" >> "$GITHUB_OUTPUT"
   validate_git_flow:
     name: "🔀 01 · Validar fluxo de branches"
     runs-on: ubuntu-latest
     steps:
-      - env:
+      - name: "🔀 01 · Conferir origem e destino do PR"
+        env:
           BASE_BRANCH: ${{ github.base_ref }}
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
+          echo "Base branch: $BASE_BRANCH"
+          echo "Head branch: $HEAD_BRANCH"
           case "$BASE_BRANCH" in
-            develop) case "$HEAD_BRANCH" in main|release|release/*) exit 1;; *) exit 0;; esac;;
-            release|release/*) test "$HEAD_BRANCH" = develop;;
-            main) case "$HEAD_BRANCH" in release|release/*) exit 0;; *) exit 1;; esac;;
-            *) exit 1;;
+            develop)
+              case "$HEAD_BRANCH" in
+                main|release|release/*) echo "Protected stage branches must not open pull requests back to develop."; exit 1 ;;
+                *) echo "Pull request to develop follows the Git Flow entry point." ;;
+              esac ;;
+            release|release/*)
+              if [ "$HEAD_BRANCH" != "develop" ]; then echo "Pull requests to release must come from develop."; exit 1; fi
+              echo "Pull request to release follows the Git Flow promotion path." ;;
+            main)
+              case "$HEAD_BRANCH" in release|release/*) echo "Pull request to main follows the Git Flow production promotion path." ;; *) echo "Pull requests to main must come from release or release/*."; exit 1;; esac ;;
+            *) echo "Unsupported protected base branch: $BASE_BRANCH"; exit 1 ;;
           esac
   validate_terraform:
     name: "🌐 02 · Validar Terraform do API Gateway"
@@ -58,21 +88,29 @@ jobs:
     if: needs.detect_ci_scope.outputs.ci_required == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: hashicorp/setup-terraform@v4
+      - name: "📥 01 · Baixar código do repositório"
+        uses: actions/checkout@v7
+      - name: "🛠️ 02 · Instalar Terraform"
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
-      - run: terraform fmt -check -recursive infra/terraform
-      - run: terraform -chdir="$TF_WORKING_DIRECTORY" init -backend=false -input=false
-      - run: terraform -chdir="$TF_WORKING_DIRECTORY" validate
+      - name: "🎨 03 · Verificar formatação Terraform"
+        run: terraform fmt -check -recursive infra/terraform
+      - name: "🚀 04 · Inicializar Terraform sem backend"
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" init -backend=false -input=false
+      - name: "🔍 05 · Validar configuração Terraform"
+        run: terraform -chdir="$TF_WORKING_DIRECTORY" validate
   quality_gate:
     name: "🚦 03 · Quality gate"
     needs: [detect_ci_scope, validate_git_flow, validate_terraform]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          test "${{ needs.detect_ci_scope.result }}" = success
-          test "${{ needs.validate_git_flow.result }}" = success
-          if [ "${{ needs.detect_ci_scope.outputs.ci_required }}" = true ]; then test "${{ needs.validate_terraform.result }}" = success; fi
+      - name: "🚦 01 · Conferir status de todos os jobs do CI"
+        run: |
+          if [ "${{ needs.detect_ci_scope.result }}" != "success" ]; then echo "CI scope detection failed."; exit 1; fi
+          if [ "${{ needs.validate_git_flow.result }}" != "success" ]; then echo "Git Flow branch validation failed."; exit 1; fi
+          if [ "${{ needs.detect_ci_scope.outputs.ci_required }}" != "true" ]; then echo "Only documentation or bootstrap files changed. Heavy CI skipped safely."; exit 0; fi
+          if [ "${{ needs.validate_terraform.result }}" != "success" ]; then echo "Terraform validation failed."; exit 1; fi
+          echo "All CI responsibilities passed."
