@@ -1,0 +1,11 @@
+name: "🏁 CD Production"
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy-production:
+    name: "🏁 01 · Validar promoção em production"
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo "Promoção lógica; nenhuma operação AWS é executada."

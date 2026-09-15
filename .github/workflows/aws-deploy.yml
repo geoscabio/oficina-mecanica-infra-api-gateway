@@ -1,0 +1,93 @@
+name: "☁️ AWS Deploy"
+on:
+  workflow_call:
+    inputs:
+      environment_name: { required: true, type: string }
+    outputs:
+      terraform_action: { value: '${{ jobs.resolve_action.outputs.terraform_action }}' }
+env:
+  TF_WORKING_DIRECTORY: infra/terraform/environments/dev
+  TERRAFORM_VERSION: "1.15.8"
+  SSM_VPC_PREFIX: /oficina-mecanica/development/vpc
+  SSM_VPC_STATUS_PARAMETER: /oficina-mecanica/development/status/vpc
+  SSM_KUBERNETES_PREFIX: /oficina-mecanica/development/kubernetes
+  SSM_KUBERNETES_STATUS_PARAMETER: /oficina-mecanica/development/status/kubernetes
+  SSM_AUTH_LAMBDA_PREFIX: /oficina-mecanica/development/auth-lambda
+  SSM_AUTH_LAMBDA_STATUS_PARAMETER: /oficina-mecanica/development/status/auth-lambda
+  SSM_API_GATEWAY_PREFIX: /oficina-mecanica/development/api-gateway
+  SSM_API_GATEWAY_STATUS_PARAMETER: /oficina-mecanica/development/status/api-gateway
+jobs:
+  resolve_action:
+    name: "🔎 01 · Resolver ação do Terraform"
+    runs-on: ubuntu-latest
+    environment: { name: '${{ inputs.environment_name }}' }
+    outputs: { terraform_action: '${{ steps.resolve.outputs.terraform_action }}' }
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - id: resolve
+        env: { GITHUB_BEFORE: '${{ github.event.before }}' }
+        run: |
+          set -euo pipefail; file="$TF_WORKING_DIRECTORY/terraform-action.env"; test -f "$file" || { echo '::error::terraform-action.env ausente.'; exit 1; }
+          action="$(grep -E '^[[:space:]]*TERRAFORM_ACTION=' "$file" | tail -1 | cut -d= -f2 | tr -d '\r' | xargs)"; case "$action" in apply|destroy) ;; *) echo '::error::Ação inválida.'; exit 1;; esac
+          if [ "$action" = destroy ] && ! git diff --name-only "$GITHUB_BEFORE" "$GITHUB_SHA" -- "$file" | grep -qx "$file"; then echo '::warning::Destroy exige alteração do terraform-action.env no próprio push.'; exit 1; fi
+          [ "$action" != destroy ] || echo '::warning::DESTROY selecionado.'; echo "terraform_action=$action" >> "$GITHUB_OUTPUT"
+  prepare_and_plan:
+    name: "📋 02 · Preparar e gerar plano do Terraform"
+    needs: resolve_action
+    runs-on: ubuntu-latest
+    environment: { name: '${{ inputs.environment_name }}' }
+    env: { AWS_REGION: '${{ vars.AWS_REGION || 'us-east-1' }}', TERRAFORM_ACTION: '${{ needs.resolve_action.outputs.terraform_action }}' }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with: { aws-access-key-id: '${{ secrets.AWS_ACCESS_KEY_ID }}', aws-secret-access-key: '${{ secrets.AWS_SECRET_ACCESS_KEY }}', aws-session-token: '${{ secrets.AWS_SESSION_TOKEN }}', aws-region: '${{ env.AWS_REGION }}' }
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: '${{ env.TERRAFORM_VERSION }}', terraform_wrapper: false }
+      - name: "🚦 Validar dependências reais"
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: |
+          set -euo pipefail
+          get(){ aws ssm get-parameter --name "$1" --query Parameter.Value --output text; }
+          test "$(get "$SSM_VPC_STATUS_PARAMETER")" = ready; test "$(get "$SSM_KUBERNETES_STATUS_PARAMETER")" = ready; test "$(get "$SSM_AUTH_LAMBDA_STATUS_PARAMETER")" = ready
+          vpc="$(get "$SSM_VPC_PREFIX/vpc_id")"; subs="$(get "$SSM_VPC_PREFIX/private_subnet_ids")"; sg="$(get "$SSM_KUBERNETES_PREFIX/internal_nlb_security_group_id")"; listener="$(get "$SSM_KUBERNETES_PREFIX/internal_nlb_listener_arn")"; arn="$(get "$SSM_AUTH_LAMBDA_PREFIX/function_arn")"; fn="$(get "$SSM_AUTH_LAMBDA_PREFIX/function_name")"
+          test -n "$vpc$subs$sg$listener$arn$fn"; test "$(aws ec2 describe-vpcs --vpc-ids "$vpc" --query 'Vpcs[0].State' --output text)" = available
+          for s in ${subs//,/ }; do test "$(aws ec2 describe-subnets --subnet-ids "$s" --query 'Subnets[0].State' --output text)" = available; test "$(aws ec2 describe-subnets --subnet-ids "$s" --query 'Subnets[0].VpcId' --output text)" = "$vpc"; done
+          test "$(aws ec2 describe-security-groups --group-ids "$sg" --query 'SecurityGroups[0].VpcId' --output text)" = "$vpc"; lb="$(aws elbv2 describe-listeners --listener-arns "$listener" --query 'Listeners[0].LoadBalancerArn' --output text)"; test "$(aws elbv2 describe-load-balancers --load-balancer-arns "$lb" --query 'LoadBalancers[0].Scheme' --output text)" = internal; test "$(aws elbv2 describe-load-balancers --load-balancer-arns "$lb" --query 'LoadBalancers[0].State.Code' --output text)" = active; tg="$(aws elbv2 describe-listeners --listener-arns "$listener" --query 'Listeners[0].DefaultActions[0].TargetGroupArn' --output text)"; test "$(aws elbv2 describe-target-health --target-group-arn "$tg" --query 'length(TargetHealthDescriptions[?TargetHealth.State==`healthy`])' --output text)" -gt 0; test "$(aws lambda get-function-configuration --function-name "$fn" --query State --output text)" = Active; test "$(aws lambda get-function --function-name "$fn" --query 'Configuration.FunctionArn' --output text)" = "$arn"
+      - uses: actions/cache/restore@v6
+        with: { path: '${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate\n${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup', key: 'tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}', restore-keys: 'tfstate-api-gateway-${{ inputs.environment_name }}-' }
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" init -input=false
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" validate
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" plan ${{ needs.resolve_action.outputs.terraform_action == 'destroy' && '-destroy' || '' }} -input=false -out=tfplan
+      - uses: actions/upload-artifact@v7
+        with: { name: 'tfplan-api-gateway-${{ github.run_id }}', path: '${{ env.TF_WORKING_DIRECTORY }}/tfplan', retention-days: 1 }
+  apply_or_destroy:
+    name: "☁️ 03 · Aplicar ou destruir API Gateway"
+    needs: [resolve_action, prepare_and_plan]
+    runs-on: ubuntu-latest
+    environment: { name: '${{ inputs.environment_name }}' }
+    env: { AWS_REGION: '${{ vars.AWS_REGION || 'us-east-1' }}', TERRAFORM_ACTION: '${{ needs.resolve_action.outputs.terraform_action }}' }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with: { aws-access-key-id: '${{ secrets.AWS_ACCESS_KEY_ID }}', aws-secret-access-key: '${{ secrets.AWS_SECRET_ACCESS_KEY }}', aws-session-token: '${{ secrets.AWS_SESSION_TOKEN }}', aws-region: '${{ env.AWS_REGION }}' }
+      - uses: hashicorp/setup-terraform@v4
+        with: { terraform_version: '${{ env.TERRAFORM_VERSION }}', terraform_wrapper: false }
+      - uses: actions/cache/restore@v6
+        with: { path: '${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate\n${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup', key: 'tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}', restore-keys: 'tfstate-api-gateway-${{ inputs.environment_name }}-' }
+      - uses: actions/download-artifact@v8
+        with: { name: 'tfplan-api-gateway-${{ github.run_id }}', path: '${{ env.TF_WORKING_DIRECTORY }}' }
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" init -input=false
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" apply -input=false -auto-approve tfplan
+      - uses: actions/cache/save@v6
+        if: always()
+        with: { path: '${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate\n${{ env.TF_WORKING_DIRECTORY }}/terraform.tfstate.backup', key: 'tfstate-api-gateway-${{ inputs.environment_name }}-${{ github.run_id }}' }
+      - name: "🔎 Validar API Gateway real após apply"
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: |
+          set -euo pipefail; id="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_id)"; endpoint="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw api_gateway_endpoint)"; link="$(terraform -chdir="$TF_WORKING_DIRECTORY" output -raw vpc_link_id)"
+          test "$(aws apigatewayv2 get-api --api-id "$id" --query ProtocolType --output text)" = HTTP; test "$(aws apigatewayv2 get-stage --api-id "$id" --stage-name '$default' --query AutoDeploy --output text)" = True
+          for n in $(seq 1 60); do s="$(aws apigatewayv2 get-vpc-link --vpc-link-id "$link" --query VpcLinkStatus --output text)"; [ "$s" = AVAILABLE ] && break; [ "$s" = FAILED ] && exit 1; sleep 10; done; test "$s" = AVAILABLE
+          aws apigatewayv2 get-routes --api-id "$id" --query 'Items[].RouteKey' --output text | grep -Fx 'POST /auth/documento'; aws apigatewayv2 get-routes --api-id "$id" --query 'Items[].RouteKey' --output text | grep -Fx 'ANY /api/{proxy+}'; ! aws apigatewayv2 get-routes --api-id "$id" --query 'Items[].RouteKey' --output text | grep -Fx '/api/health'
+          test "$(aws ssm get-parameter --name "$SSM_API_GATEWAY_PREFIX/api-endpoint" --query Parameter.Value --output text)" = "$endpoint"; test "$(aws ssm get-parameter --name "$SSM_API_GATEWAY_STATUS_PARAMETER" --query Parameter.Value --output text)" = ready
+          for n in $(seq 1 10); do curl -fsS "$endpoint/api/health" && exit 0 || sleep 6; done; exit 1

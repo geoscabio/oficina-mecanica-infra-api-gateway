@@ -1,0 +1,47 @@
+name: "🚀 CD Development"
+run-name: "🚀 Deploy em development"
+on:
+  push:
+    branches: [develop]
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+env:
+  RELEASE_BRANCH: ${{ vars.RELEASE_BRANCH || 'release' }}
+jobs:
+  detect-deploy-scope:
+    name: "🔎 01 · Detectar se há mudança que exige deploy"
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_required: ${{ steps.detect.outputs.deploy_required }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - id: detect
+        run: |
+          base="${{ github.event.before }}"; [ "$base" = "0000000000000000000000000000000000000000" ] && base=HEAD~1
+          if git diff --name-only "$base" "$GITHUB_SHA" | grep -Eq '^(infra/terraform/|\.github/workflows/(aws-deploy|cd-development)\.yml$)'; then echo deploy_required=true >> "$GITHUB_OUTPUT"; else echo deploy_required=false >> "$GITHUB_OUTPUT"; fi
+  deploy-development:
+    name: "☁️ 02 · Deploy em development"
+    needs: detect-deploy-scope
+    if: needs.detect-deploy-scope.outputs.deploy_required == 'true'
+    uses: ./.github/workflows/aws-deploy.yml
+    with: { environment_name: development }
+    secrets: inherit
+  open-pr-to-release:
+    name: "🔀 03 · Abrir PR para release"
+    needs: [detect-deploy-scope, deploy-development]
+    if: >-
+      !cancelled() && vars.AUTO_PR_ENABLED == 'true' && needs.detect-deploy-scope.result == 'success' && (needs.deploy-development.result == 'success' || (needs.detect-deploy-scope.outputs.deploy_required == 'false' && needs.deploy-development.result == 'skipped'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: |
+          git fetch origin develop "$RELEASE_BRANCH"
+          [ "$(git rev-parse origin/develop)" = "$GITHUB_SHA" ] || exit 0
+          gh pr list --base "$RELEASE_BRANCH" --head develop --state open --json number --jq '.[0].number' | grep -q . || gh pr create --base "$RELEASE_BRANCH" --head develop --title "ci(release): deploy develop to $RELEASE_BRANCH" --body "PR automático após CD físico bem-sucedido em development."

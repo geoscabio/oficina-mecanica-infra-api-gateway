@@ -1,0 +1,24 @@
+name: "🔀 CD Release"
+on:
+  push:
+    branches: [release, 'release/**']
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  deploy-homologation:
+    name: "🔀 01 · Validar promoção em homologation"
+    runs-on: ubuntu-latest
+    environment: homologation
+    steps:
+      - run: echo "Promoção lógica; nenhuma operação AWS é executada."
+  open-pr-to-main:
+    name: "🔀 02 · Abrir PR para main"
+    needs: deploy-homologation
+    if: vars.AUTO_PR_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: gh pr list --base main --head "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number' | grep -q . || gh pr create --base main --head "$GITHUB_REF_NAME" --title "ci(main): promover $GITHUB_REF_NAME" --body "Promoção lógica; nenhuma operação AWS é executada."
