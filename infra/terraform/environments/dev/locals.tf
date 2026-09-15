@@ -8,6 +8,11 @@ locals {
     Repository  = "oficina-mecanica-infra-api-gateway"
   }
 
+  observability_tags = {
+    env     = var.environment
+    service = "oficina-mecanica-api-gateway"
+  }
+
   vpc_id = data.aws_ssm_parameter.vpc_id.value
 
   private_subnet_ids = split(
