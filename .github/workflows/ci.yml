@@ -1,0 +1,78 @@
+name: "🧪 CI"
+run-name: "🧪 Validar código · ${{ github.head_ref || github.ref_name }}"
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - release
+      - "release/**"
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_WORKING_DIRECTORY: infra/terraform/environments/dev
+  TERRAFORM_VERSION: "1.15.8"
+
+jobs:
+  detect_ci_scope:
+    name: "🔎 00 · Detectar escopo do PR"
+    runs-on: ubuntu-latest
+    outputs:
+      ci_required: ${{ steps.detect.outputs.ci_required }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          ci_required=false
+          if [ -d infra/terraform ] && git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -qvE '\.md$'; then ci_required=true; fi
+          echo "ci_required=$ci_required" >> "$GITHUB_OUTPUT"
+  validate_git_flow:
+    name: "🔀 01 · Validar fluxo de branches"
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          case "$BASE_BRANCH" in
+            develop) case "$HEAD_BRANCH" in main|release|release/*) exit 1;; *) exit 0;; esac;;
+            release|release/*) test "$HEAD_BRANCH" = develop;;
+            main) case "$HEAD_BRANCH" in release|release/*) exit 0;; *) exit 1;; esac;;
+            *) exit 1;;
+          esac
+  validate_terraform:
+    name: "🌐 02 · Validar Terraform do API Gateway"
+    needs: detect_ci_scope
+    if: needs.detect_ci_scope.outputs.ci_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive infra/terraform
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" init -backend=false -input=false
+      - run: terraform -chdir="$TF_WORKING_DIRECTORY" validate
+  quality_gate:
+    name: "🚦 03 · Quality gate"
+    needs: [detect_ci_scope, validate_git_flow, validate_terraform]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          test "${{ needs.detect_ci_scope.result }}" = success
+          test "${{ needs.validate_git_flow.result }}" = success
+          if [ "${{ needs.detect_ci_scope.outputs.ci_required }}" = true ]; then test "${{ needs.validate_terraform.result }}" = success; fi
