@@ -11,10 +11,6 @@ resource "aws_ssm_parameter" "status" {
   depends_on = [
     aws_apigatewayv2_api.gateway,
     aws_apigatewayv2_stage.default,
-    aws_apigatewayv2_integration.auth_lambda,
-    aws_apigatewayv2_route.auth_documento,
-    aws_apigatewayv2_integration.private_api,
-    aws_apigatewayv2_route.private_api,
     aws_apigatewayv2_vpc_link.gateway,
     aws_lambda_permission.gateway_auth,
     aws_security_group.vpc_link,

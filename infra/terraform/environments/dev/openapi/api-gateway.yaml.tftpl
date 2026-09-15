@@ -1,0 +1,130 @@
+openapi: 3.0.1
+
+info:
+  title: Oficina Mecânica API Gateway
+  description: Contrato da entrada pública da Oficina Mecânica.
+  version: 1.0.0
+
+paths:
+  /auth/documento:
+    post:
+      summary: Autenticar cliente por documento
+      description: Autentica um cliente por CPF ou CNPJ por meio da Auth Lambda.
+      operationId: autenticarClientePorDocumento
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthDocumentoRequest"
+            example:
+              documento: "***.***.***-**"
+      responses:
+        "200":
+          description: Cliente autenticado com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthDocumentoResponse"
+        "400":
+          description: Requisição ou documento inválido.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Documento não autorizado.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Erro interno inesperado.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+      x-amazon-apigateway-integration:
+        $ref: "#/components/x-amazon-apigateway-integrations/authLambda"
+
+  /api/{proxy+}:
+    x-amazon-apigateway-any-method:
+      summary: Encaminhar requisição para a API privada
+      description: Requests sob /api/* são encaminhados sem o Gateway conhecer cada endpoint da aplicação.
+      operationId: encaminharParaApiPrivada
+      parameters:
+        - name: proxy
+          in: path
+          required: true
+          description: Caminho interno pertencente à API da Oficina Mecânica.
+          schema:
+            type: string
+      responses:
+        default:
+          description: Resposta produzida pela API privada.
+      x-amazon-apigateway-integration:
+        $ref: "#/components/x-amazon-apigateway-integrations/privateApi"
+
+components:
+  schemas:
+    AuthDocumentoRequest:
+      type: object
+      required:
+        - documento
+      properties:
+        documento:
+          type: string
+          description: CPF ou CNPJ do cliente, com ou sem máscara.
+
+    AuthDocumentoResponse:
+      type: object
+      required:
+        - accessToken
+        - tokenType
+        - expiresIn
+      properties:
+        accessToken:
+          type: string
+          description: JWT emitido para o cliente autenticado.
+        tokenType:
+          type: string
+          description: Tipo do token emitido.
+        expiresIn:
+          type: integer
+          format: int32
+          description: Tempo de validade do token em segundos.
+
+    ErrorResponse:
+      type: object
+      required:
+        - mensagem
+        - tipo
+      properties:
+        mensagem:
+          type: string
+          description: Mensagem sanitizada para o cliente.
+        tipo:
+          type: string
+          description: Categoria do erro retornado pela Auth Lambda.
+        erros:
+          type: array
+          description: Detalhes sanitizados de validação, quando aplicável.
+          items:
+            type: string
+
+  x-amazon-apigateway-integrations:
+    authLambda:
+      type: aws_proxy
+      httpMethod: POST
+      uri: "arn:aws:apigateway:${aws_region}:lambda:path/2015-03-31/functions/${auth_lambda_function_arn}/invocations"
+      payloadFormatVersion: "2.0"
+
+    privateApi:
+      type: http_proxy
+      httpMethod: ANY
+      connectionType: VPC_LINK
+      connectionId: "${vpc_link_id}"
+      uri: "${internal_nlb_listener_arn}"
+      payloadFormatVersion: "1.0"
+      requestParameters:
+        "overwrite:path": "$request.path"
