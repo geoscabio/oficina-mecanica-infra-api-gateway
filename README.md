@@ -31,13 +31,13 @@ API Gateway HTTP API
    +-- ANY /api/{proxy+} -> VPC Link -> NLB interno -> EKS/API
 ```
 
-| Rota | Destino planejado |
+| Rota | Destino |
 | --- | --- |
 | `POST /auth/documento` | Auth Lambda |
 | `ANY /api/{proxy+}` | VPC Link → NLB interno → EKS/API |
 | `/api/health` | Atendida pela rota proxy |
 
-O backend permanecerá privado; o Gateway será a entrada pública única somente após o cutover F3-012.
+O backend é privado; o Gateway é a entrada pública única após o cutover F3-012.
 
 ### OpenAPI do edge × Swagger da aplicação
 
@@ -149,6 +149,23 @@ terraform -chdir=infra/terraform/environments/dev init -backend=false -input=fal
 terraform -chdir=infra/terraform/environments/dev validate
 ```
 
+## 🔐 GitHub Environment e operação
+
+Crie em **Settings > Environments > development**:
+
+| Nome | Tipo | Valor esperado em termos conceituais |
+| --- | --- | --- |
+| `AWS_ACCESS_KEY_ID` | Environment Secret | Access key temporária do AWS Academy. |
+| `AWS_SECRET_ACCESS_KEY` | Environment Secret | Secret key temporária do AWS Academy. |
+| `AWS_SESSION_TOKEN` | Environment Secret | Token temporário da sessão AWS Academy. |
+| `AWS_REGION` | Environment Variable | Região AWS, com fallback `us-east-1`. |
+| `AUTO_PR_ENABLED` | Repository Variable | `true` quando as promoções automáticas estiverem habilitadas. |
+| `RELEASE_BRANCH` | Repository Variable | Branch de promoção, com fallback `release`. |
+
+O merge em `develop` executa o deploy automaticamente quando há mudança deployável. `infra/terraform/environments/dev/terraform-action.env` controla `apply` ou `destroy`; destroy exige alteração dedicada e não deve ser disparado junto com mudanças funcionais.
+
+Após `apply`, valide o endpoint publicado no SSM, o VPC Link em estado `AVAILABLE`, o NLB interno com targets saudáveis, `POST /auth/documento`, `/api/health` e a proteção JWT. O stage `$default` grava access logs estruturados no CloudWatch. A integração Datadog/AWS pode consumir essa fonte como evolução, mas este repositório não declara nem afirma um Datadog Forwarder funcional.
+
 ---
 
 ## 🧨 Ordem de operação
@@ -184,18 +201,15 @@ terraform -chdir=infra/terraform/environments/dev validate
 | README | ✅ |
 | Terraform | ✅ |
 | Contrato OpenAPI do edge | ✅ |
-| CD Development | ⏳ |
-| AWS Deploy | ⏳ |
-| Deploy real | ⏳ |
-| E2E F3-012 | ⏳ |
-| Cutover | ⏳ |
+| CD Development | ✅ |
+| AWS Deploy | ✅ |
+| Deploy real | ✅ Implementado pela esteira |
+| E2E F3-012 | ✅ Concluído |
+| Cutover | ✅ Concluído |
 
-## 🗺️ Próximos passos
+## 🗺️ Evoluções pós-entrega
 
-1. Auditoria e merge da refatoração OpenAPI-first
-2. Merge separado do CD Development / AWS Deploy pelo PR #5
-3. `terraform-action.env`
-4. GitHub Environment/secrets/variables
-5. Deploy real
-6. E2E F3-012
-7. Remoção da exposição pública legada somente após aceite
+- ampliar alertas específicos a partir dos access logs do CloudWatch;
+- integrar essa fonte ao Datadog quando houver permissões e mecanismo de ingestão validados.
+
+Documentação central e arquitetura completa: [README da Oficina Mecânica API](https://github.com/geoscabio/oficina-mecanica-api).
